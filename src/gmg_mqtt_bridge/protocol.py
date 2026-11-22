@@ -1,9 +1,10 @@
 """The Green Mountain Grill local protocol: just enough to read its status.
 
-The grill listens on UDP 8080 and answers short ASCII commands. This module
-only knows the two read-only ones: `UL!` (serial number) and `UR001!`
-(status). It has no way to send power, temperature or probe commands, on
-purpose: nothing behind this bridge can light or change the grill.
+The grill listens on UDP 8080 and answers short ASCII commands. Reads:
+`UL!` (serial number) and `UR001!` (status). Writes, which the bridge only
+sends when HA asks and its safety checks pass (see bridge.py): `UK001!`
+(power on), `UK004!` (power off) and `UT<nnn>!` (grill set point, °F).
+Probe targets and cold smoke are left out on purpose.
 
 Status reply layout (byte offsets; temperatures are °F, two bytes, low first):
 
@@ -33,6 +34,15 @@ from dataclasses import dataclass
 UDP_PORT = 8080
 CODE_SERIAL = b"UL!"
 CODE_STATUS = b"UR001!"
+CODE_POWER_ON = b"UK001!"
+CODE_POWER_OFF = b"UK004!"
+
+# The grill's own set-point range.
+MIN_SET_F = 150
+MAX_SET_F = 500
+# The GMG manual says not to change the set point until the grill has reached
+# about 150°F after lighting; the controls unlock a little before that.
+UNLOCK_F = 145
 
 STATUS_HEADER = b"UR"
 # The highest offset read is 33. Grills do send short datagrams now and then
@@ -52,6 +62,12 @@ WARNINGS = ["fan_overload", "auger_overload", "ignitor_overload", "low_battery",
 
 # The headline state, for dashboards and automations.
 STATES = ["off", "starting", "running", "cooldown", "cold_smoke"]
+
+
+def set_temp_command(target: int) -> bytes:
+    if not MIN_SET_F <= target <= MAX_SET_F:
+        raise ValueError(f"set point {target}°F is outside {MIN_SET_F}-{MAX_SET_F}°F")
+    return b"UT%03d!" % target
 
 
 def _u16(raw: bytes, i: int) -> int:
@@ -99,6 +115,11 @@ class Status:
     @property
     def active(self) -> bool:
         return self.state != "off"
+
+    @property
+    def lit(self) -> bool:
+        """Burning (or lighting): what the power switch shows as on."""
+        return self.state in ("starting", "running", "cold_smoke")
 
     def as_json(self) -> dict:
         return {
